@@ -47,7 +47,8 @@ _stats: dict[str, _Stat] = {}
 _children: dict[str, list[str]] = {}
 _counters: dict[str, int] = {}
 _flushed = False
-_warmup_remaining = _WARMUP_TARGET  # shared across all timers/counters
+_recording_enabled = False  # set True explicitly once warmup is complete
+_PROCESS_START = time.perf_counter()
 
 
 def enabled() -> bool:
@@ -63,30 +64,20 @@ def warmup_rounds() -> int:
     return max(_WARMUP_TARGET, 0)
 
 
-def in_warmup() -> bool:
-    """True while we are still discarding runs as warmup."""
-    with _lock:
-        return _warmup_remaining > 0
-
-
-def begin_round() -> bool:
-    """Each top-level pipeline entry should call this once. Returns True if this
-    round is warmup (profiling is disabled); False if it is the measured round.
-    The second call after warmup returns False and resets all accumulated stats.
-    """
-    global _warmup_remaining
+def start_recording() -> None:
+    """Called once (in the CLI main, after N warmup runs finish) to arm timers."""
+    global _recording_enabled
     if not _ENABLED:
-        return False
+        return
     with _lock:
-        if _warmup_remaining > 0:
-            _warmup_remaining -= 1
-            return True
-        # First measured round: drop any stale stats and start fresh.
         _stats.clear()
         _children.clear()
         _counters.clear()
-        _warmup_remaining = _WARMUP_TARGET  # so nested recursive calls don't re-trigger warmup
-    return False
+        _recording_enabled = True
+
+
+def recording_is_on() -> bool:
+    return _recording_enabled
 
 
 def null():
@@ -95,16 +86,7 @@ def null():
 
 
 def _should_record() -> bool:
-    """Cheap check used by every timer/count/record. Skips if profiling is off or we are still
-    in warmup (the caller is expected to have suppressed the warmup round via begin_round()).
-    """
-    if not _ENABLED:
-        return False
-    if _WARMUP_TARGET == 0:
-        return True
-    # Only record after we have entered the measured round.
-    with _lock:
-        return _warmup_remaining <= 0
+    return _ENABLED and _recording_enabled
 
 
 def _sync() -> None:
@@ -200,13 +182,13 @@ def flush() -> None:
 
 
 def reset() -> None:
-    global _flushed, _warmup_remaining
+    global _flushed, _recording_enabled
     with _lock:
         _stats.clear()
         _children.clear()
         _counters.clear()
         _flushed = False
-        _warmup_remaining = 0  # force all subsequent timer/count/record to log
+        _recording_enabled = False
 
 
 atexit.register(flush)

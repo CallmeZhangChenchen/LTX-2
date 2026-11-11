@@ -390,33 +390,6 @@ class DistilledPipeline:
         sampler on an LTX-2.5+ checkpoint, the deterministic one below that.
         ``chunk_config=None`` plans a single chunk covering the snapped clip.
         """
-        # Warmup pass: run the full pipeline N times so torch.compile / CUDA graph / kernel
-        # JIT settle before we start recording.  profiling.begin_round() returns True for
-        # warmup and silently discards every timer/count inside this round.
-        if profiling.begin_round():
-            print(
-                f"[ltx_profiling] warmup pass (remaining after this: {profiling.warmup_rounds()})",
-                flush=True,
-            )
-            _ = self(
-                prompt=prompt,
-                seed=seed,
-                height=height,
-                width=width,
-                frame_rate=frame_rate,
-                images=images,
-                num_frames=num_frames,
-                vae_dtype=vae_dtype,
-                tiling_config=tiling_config,
-                enhance_prompt=enhance_prompt,
-                enhance_static_cache=enhance_static_cache,
-                stage_1_sigmas=stage_1_sigmas,
-                stage_2_sigmas=stage_2_sigmas,
-                color_space=color_space,
-                generated_keyframes=generated_keyframes,
-                decode_with_keyframes=decode_with_keyframes,
-                chunk_config=chunk_config,
-            )
         chunks, num_frames, tiling_config = self.stream_chunks(
             prompt=prompt,
             seed=seed,
@@ -570,6 +543,37 @@ def main() -> None:
     )
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     chunk_config = chunk_config_from_args(args)
+
+    # ---- warmup: run the full pipeline N times so torch.compile / CUDA graph / kernel JIT ----
+    # settle before we start recording.  profiling is off during warmup so all timers
+    # and counters are skipped.
+    for i in range(profiling.warmup_rounds()):
+        print(f"[ltx_profiling] warmup pass {i + 1}/{profiling.warmup_rounds()}", flush=True)
+        try:
+            _ = list(
+                pipeline.stream_chunks(
+                    prompt=args.prompt,
+                    seed=args.seed,
+                    height=args.height,
+                    width=args.width,
+                    num_frames=args.num_frames,
+                    frame_rate=args.frame_rate,
+                    images=args.images,
+                    vae_dtype=vae_dtype,
+                    color_space=hdr,
+                    enhance_prompt=args.enhance_prompt,
+                    enhance_static_cache=args.enhance_static_cache,
+                    tiling_config=AUTO_TILING,
+                    generated_keyframes=args.num_generated_keyframes,
+                    decode_with_keyframes=args.decode_with_keyframes,
+                    chunk_config=chunk_config,
+                )[0]
+            )
+        except Exception as exc:  # noqa: BLE001  — warmup failures shouldn't kill the real run
+            print(f"[ltx_profiling] warmup raised {exc!r}, continuing to measured run", flush=True)
+
+    # ---- measured run: arm timers, then the real stream_chunks ----
+    profiling.start_recording()
     chunks, _, _ = pipeline.stream_chunks(
         prompt=args.prompt,
         seed=args.seed,

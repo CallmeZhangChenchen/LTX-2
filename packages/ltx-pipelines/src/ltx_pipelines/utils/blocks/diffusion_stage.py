@@ -420,58 +420,61 @@ class DiffusionStage:
 
         # Build video_tools up front so it can be forwarded to the transformer
         # context (required by TiledDataParallelBuilder in multi-GPU mode).
-        video_tools = (
-            VideoLatentTools(
-                VideoLatentPatchifier(patch_size=1),
-                VideoLatentShape.from_torch_shape(video_latent.shape),
-                conditioning_fps,
-                scale_factors=self.video_scale_factors,
+        with profiling.timer("stage.tools"):
+            video_tools = (
+                VideoLatentTools(
+                    VideoLatentPatchifier(patch_size=1),
+                    VideoLatentShape.from_torch_shape(video_latent.shape),
+                    conditioning_fps,
+                    scale_factors=self.video_scale_factors,
+                )
+                if video_latent is not None
+                else None
             )
-            if video_latent is not None
-            else None
-        )
 
         mode = "streaming" if self._is_streaming else "standard"
         builder = self._transformer_builder
         checkpoint = builder.paths if isinstance(builder, SimpleBuilder) else builder.base.paths
         logger.info("Building transformer (%s) from %s", mode, checkpoint)
-        with self._transformer_ctx(video_tools=video_tools) as built:
-            transformer = built if self._model_wrapper is None else self._model_wrapper(built, video_tools)
-            logger.info(
-                "Running denoising loop (%d steps, video latent %s, audio latent %s @ %.1f fps)",
-                len(sigmas) - 1,
-                tuple(video_latent.shape) if video_latent is not None else None,
-                tuple(audio_latent.shape) if audio_latent is not None else None,
-                conditioning_fps,
-            )
-            video_state: LatentState | None = None
-            if video is not None and video_tools is not None:
-                video_state = _build_state(video, video_tools, noiser, self._dtype, self._device)
-
-            audio_tools = (
-                AudioLatentTools(
-                    AudioPatchifier(patch_size=1),
-                    AudioLatentShape.from_torch_shape(audio_latent.shape),
+        with profiling.timer("stage.build"):
+            with self._transformer_ctx(video_tools=video_tools) as built:
+                transformer = built if self._model_wrapper is None else self._model_wrapper(built, video_tools)
+                logger.info(
+                    "Running denoising loop (%d steps, video latent %s, audio latent %s @ %.1f fps)",
+                    len(sigmas) - 1,
+                    tuple(video_latent.shape) if video_latent is not None else None,
+                    tuple(audio_latent.shape) if audio_latent is not None else None,
+                    conditioning_fps,
                 )
-                if audio_latent is not None
-                else None
-            )
-            audio_state: LatentState | None = None
-            if audio is not None and audio_tools is not None:
-                audio_state = _build_state(audio, audio_tools, noiser, self._dtype, self._device)
+                with profiling.timer("stage.init_state"):
+                    video_state: LatentState | None = None
+                    if video is not None and video_tools is not None:
+                        video_state = _build_state(video, video_tools, noiser, self._dtype, self._device)
 
-            wrapped = BatchSplitAdapter(transformer, max_batch_size=max_batch_size)  # type: ignore[arg-type]
-            profiling.count("stage.calls")
-            with profiling.timer("stage.denoise_loop"):
-                video_state, audio_state = loop(
-                    sigmas=sigmas,
-                    video_state=video_state,
-                    audio_state=audio_state,
-                    transformer=wrapped,
-                    denoiser=denoiser,
-                    v_context=video.context if video is not None else None,
-                    a_context=audio.context if audio is not None else None,
-                )
+                    audio_tools = (
+                        AudioLatentTools(
+                            AudioPatchifier(patch_size=1),
+                            AudioLatentShape.from_torch_shape(audio_latent.shape),
+                        )
+                        if audio_latent is not None
+                        else None
+                    )
+                    audio_state: LatentState | None = None
+                    if audio is not None and audio_tools is not None:
+                        audio_state = _build_state(audio, audio_tools, noiser, self._dtype, self._device)
+
+                wrapped = BatchSplitAdapter(transformer, max_batch_size=max_batch_size)  # type: ignore[arg-type]
+                profiling.count("stage.calls")
+                with profiling.timer("stage.denoise_loop"):
+                    video_state, audio_state = loop(
+                        sigmas=sigmas,
+                        video_state=video_state,
+                        audio_state=audio_state,
+                        transformer=wrapped,
+                        denoiser=denoiser,
+                        v_context=video.context if video is not None else None,
+                        a_context=audio.context if audio is not None else None,
+                    )
 
             if video_state is not None and video_tools is not None:
                 video_state = video_tools.clear_conditioning(video_state)
