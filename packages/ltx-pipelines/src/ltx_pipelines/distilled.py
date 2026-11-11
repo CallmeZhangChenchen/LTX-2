@@ -3,6 +3,8 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import time
+
 import torch
 
 from ltx_core import profiling
@@ -190,7 +192,9 @@ class DistilledPipeline:
         self.device = device or get_device()
         self.dtype = torch.bfloat16
         registry = registry or ModelRegistry()
+        _load_t0 = time.perf_counter()
 
+        _t = time.perf_counter()
         self.prompt_encoder = PromptEncoder(
             model_paths,
             self.dtype,
@@ -200,6 +204,9 @@ class DistilledPipeline:
             alloc_trim_strategy=alloc_trim_strategy,
             prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
         )
+        print(f"[ltx_load] text_encoder (Gemma) ......... {time.perf_counter() - _t:7.2f}s")
+
+        _t = time.perf_counter()
         self.image_conditioner = ImageConditioner(
             model_paths.video_vae(),
             self.dtype,
@@ -207,6 +214,9 @@ class DistilledPipeline:
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
+        print(f"[ltx_load] video_vae (ImageConditioner) .. {time.perf_counter() - _t:7.2f}s")
+
+        _t = time.perf_counter()
         self.stage = DiffusionStage.from_checkpoint(
             model_paths.transformer(),
             self.dtype,
@@ -218,6 +228,9 @@ class DistilledPipeline:
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
         )
+        print(f"[ltx_load] transformer (DiT) ............ {time.perf_counter() - _t:7.2f}s")
+
+        _t = time.perf_counter()
         self.upsampler = VideoUpsampler(
             model_paths.video_vae(),
             spatial_upsampler_path,
@@ -226,6 +239,9 @@ class DistilledPipeline:
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
+        print(f"[ltx_load] spatial_upsampler ............ {time.perf_counter() - _t:7.2f}s")
+
+        _t = time.perf_counter()
         self.video_decoder = VideoDecoder(
             model_paths.video_vae(),
             self.dtype,
@@ -234,6 +250,9 @@ class DistilledPipeline:
             alloc_trim_strategy=alloc_trim_strategy,
             diffvae_optimization=diffvae_optimization,
         )
+        print(f"[ltx_load] video_decoder ................ {time.perf_counter() - _t:7.2f}s")
+
+        _t = time.perf_counter()
         self.audio_decoder = AudioDecoder(
             model_paths.audio_vae(),
             self.dtype,
@@ -241,14 +260,17 @@ class DistilledPipeline:
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
-        # None on checkpoints that predate DurationHead (LTX 2.5 / gemma4 only) -- __call__ requires
-        # an explicit num_frames in that case instead of crashing deep in a forward pass.
+        print(f"[ltx_load] audio_vae .................... {time.perf_counter() - _t:7.2f}s")
+
+        _t = time.perf_counter()
         self.duration_predictor = DurationPredictor.from_checkpoint(
             model_paths.duration_head_path,
             self.dtype,
             self.device,
         )
         self.use_ancestral_sampler = should_use_ancestral_sampler(model_paths.transformer())
+        print(f"[ltx_load] duration_head + sampler_probe . {time.perf_counter() - _t:7.2f}s")
+        print(f"[ltx_load] ---- total pipeline init ------ {time.perf_counter() - _load_t0:7.2f}s")
 
     def _prepare_run(  # noqa: PLR0913
         self,
