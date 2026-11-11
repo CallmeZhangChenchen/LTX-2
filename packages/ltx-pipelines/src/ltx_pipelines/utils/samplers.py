@@ -6,6 +6,7 @@ from typing import Callable
 import torch
 from tqdm import tqdm
 
+from ltx_core import profiling
 from ltx_core.components.diffusion_steps import (
     EulerAncestralDiffusionStep,
     EulerCfgPpDiffusionStep,
@@ -85,21 +86,24 @@ def euler_denoising_loop(
     """
     stepper = EulerDiffusionStep()
     schedule = HostDeviceTensorPair.on_device(sigmas, _present_state(video_state, audio_state).latent.device)
-    for step_idx in tqdm(range(len(schedule.device_tensor) - 1)):
-        video_result, audio_result = denoiser(
-            transformer,
-            video_state,
-            audio_state,
-            schedule.device_tensor,
-            step_idx,
-            v_context,
-            a_context,
-        )
-        denoised_video = video_result.denoised if video_result is not None else None
-        denoised_audio = audio_result.denoised if audio_result is not None else None
+    profiling.count("denoise.steps", len(schedule.device_tensor) - 1)
+    with profiling.timer("denoise.loop"):
+        for step_idx in tqdm(range(len(schedule.device_tensor) - 1)):
+            with profiling.timer("denoise.step"):
+                video_result, audio_result = denoiser(
+                    transformer,
+                    video_state,
+                    audio_state,
+                    schedule.device_tensor,
+                    step_idx,
+                    v_context,
+                    a_context,
+                )
+                denoised_video = video_result.denoised if video_result is not None else None
+                denoised_audio = audio_result.denoised if audio_result is not None else None
 
-        video_state = _step_state(video_state, denoised_video, stepper, schedule.host_tensor, step_idx)
-        audio_state = _step_state(audio_state, denoised_audio, stepper, schedule.host_tensor, step_idx)
+                video_state = _step_state(video_state, denoised_video, stepper, schedule.host_tensor, step_idx)
+                audio_state = _step_state(audio_state, denoised_audio, stepper, schedule.host_tensor, step_idx)
 
     return VideoAudio(video_state, audio_state)
 
@@ -602,45 +606,48 @@ def _ancestral_euler_denoising_loop(  # noqa: PLR0913
     states: dict[str, LatentState | None] = {"video": video_state, "audio": audio_state}
     schedule = HostDeviceTensorPair.on_device(sigmas, present_state.latent.device)
 
-    for step_idx in tqdm(range(len(schedule.device_tensor) - 1)):
-        video_result, audio_result = denoiser(
-            transformer,
-            states["video"],
-            states["audio"],
-            schedule.device_tensor,
-            step_idx,
-            v_context,
-            a_context,
-        )
-        pending = [
-            _ModalityStep.from_modality_result(modality, state, result, schedule, make_step_fn)
-            for modality, state, result in (
-                ("video", states["video"], video_result),
-                ("audio", states["audio"], audio_result),
-            )
-            if state is not None
-        ]
+    profiling.count("denoise.steps", len(schedule.device_tensor) - 1)
+    with profiling.timer("denoise.loop"):
+        for step_idx in tqdm(range(len(schedule.device_tensor) - 1)):
+            with profiling.timer("denoise.step"):
+                video_result, audio_result = denoiser(
+                    transformer,
+                    states["video"],
+                    states["audio"],
+                    schedule.device_tensor,
+                    step_idx,
+                    v_context,
+                    a_context,
+                )
+                pending = [
+                    _ModalityStep.from_modality_result(modality, state, result, schedule, make_step_fn)
+                    for modality, state, result in (
+                        ("video", states["video"], video_result),
+                        ("audio", states["audio"], audio_result),
+                    )
+                    if state is not None
+                ]
 
-        terminal_step = bool(schedule.host_tensor[step_idx + 1] == 0)
-        for step in pending:
-            if step.denoised is None:
-                continue
+                terminal_step = bool(schedule.host_tensor[step_idx + 1] == 0)
+                for step in pending:
+                    if step.denoised is None:
+                        continue
+                    if terminal_step:
+                        states[step.modality] = replace(step.state, latent=step.denoised.to(model_dtype))
+                        continue
+                    noise = new_noise_fn(step.state.latent, generator) if draw_noise else None
+                    x_next = step.step_fn(
+                        sample=step.state.latent.float(),
+                        denoised_sample=step.denoised,
+                        step_index=step_idx,
+                        noise=noise,
+                    )
+                    if draw_noise:
+                        x_next = post_process_latent(x_next, step.state.denoise_mask.tensor, step.state.clean_latent)
+                    states[step.modality] = replace(step.state, latent=x_next.to(model_dtype))
+
             if terminal_step:
-                states[step.modality] = replace(step.state, latent=step.denoised.to(model_dtype))
-                continue
-            noise = new_noise_fn(step.state.latent, generator) if draw_noise else None
-            x_next = step.step_fn(
-                sample=step.state.latent.float(),
-                denoised_sample=step.denoised,
-                step_index=step_idx,
-                noise=noise,
-            )
-            if draw_noise:
-                x_next = post_process_latent(x_next, step.state.denoise_mask.tensor, step.state.clean_latent)
-            states[step.modality] = replace(step.state, latent=x_next.to(model_dtype))
-
-        if terminal_step:
-            break
+                break
 
     return VideoAudio(states["video"], states["audio"])
 

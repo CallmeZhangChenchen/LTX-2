@@ -3,6 +3,7 @@ from enum import Enum
 
 import torch
 
+from ltx_core import profiling
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.disposable import Disposable
 from ltx_core.model.model_protocol import LTXModelProtocol
@@ -436,6 +437,7 @@ class LTXModel(torch.nn.Module, Disposable):
         perturbations: BatchedPerturbationConfig,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Process transformer blocks for LTX."""
+        profiling.count("ltx_model.block_calls", len(self.transformer_blocks))
         for block_idx, block in enumerate(self.transformer_blocks):
             if video is not None:
                 video = self.block_input_processor(
@@ -454,15 +456,19 @@ class LTXModel(torch.nn.Module, Disposable):
                     cross_attn_type=PerturbationType.SKIP_V2A_CROSS_ATTN,
                 )
 
-            if self._enable_gradient_checkpointing and self.training:
-                video, audio = torch.utils.checkpoint.checkpoint(
-                    block,
-                    video,
-                    audio,
-                    use_reentrant=False,
-                )
-            else:
-                video, audio = block(video=video, audio=audio)
+            block_scope = (
+                profiling.timer(f"ltx_model.block.{block_idx:02d}") if profiling.blocks_enabled() else profiling.null()
+            )
+            with block_scope:
+                if self._enable_gradient_checkpointing and self.training:
+                    video, audio = torch.utils.checkpoint.checkpoint(
+                        block,
+                        video,
+                        audio,
+                        use_reentrant=False,
+                    )
+                else:
+                    video, audio = block(video=video, audio=audio)
 
         return video, audio
 
@@ -500,43 +506,47 @@ class LTXModel(torch.nn.Module, Disposable):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
-        audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
-        # Materialize the no-perturbation mask here (eager); a None config means "perturb nothing"
-        # -> all-keep masks. The block loop never builds masks.
-        if perturbations is None:
-            ref = (video_args or audio_args).x
-            perturbations = BatchedPerturbationConfig.empty(ref.shape[0], self.num_blocks, ref.device, ref.dtype)
+        with profiling.timer("ltx_model.preprocess"):
+            video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
+            audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
+            # Materialize the no-perturbation mask here (eager); a None config means "perturb nothing"
+            # -> all-keep masks. The block loop never builds masks.
+            if perturbations is None:
+                ref = (video_args or audio_args).x
+                perturbations = BatchedPerturbationConfig.empty(ref.shape[0], self.num_blocks, ref.device, ref.dtype)
         # Process transformer blocks
-        video_out, audio_out = self._process_transformer_blocks(
-            video=video_args,
-            audio=audio_args,
-            perturbations=perturbations,
-        )
+        with profiling.timer("ltx_model.blocks"):
+            video_out, audio_out = self._process_transformer_blocks(
+                video=video_args,
+                audio=audio_args,
+                perturbations=perturbations,
+            )
 
         # Process output
-        vx = (
-            self._process_output(
-                self.scale_shift_table,
-                self.norm_out,
-                self.proj_out,
-                video_out.x,
-                video_out.timestep_embedding,
+        with profiling.timer("ltx_model.output"):
+            vx = (
+                self._process_output(
+                    self.scale_shift_table,
+                    self.norm_out,
+                    self.proj_out,
+                    video_out.x,
+                    video_out.timestep_embedding,
+                )
+                if video_out is not None
+                else None
             )
-            if video_out is not None
-            else None
-        )
-        ax = (
-            self._process_output(
-                self.audio_scale_shift_table,
-                self.audio_norm_out,
-                self.audio_proj_out,
-                audio_out.x,
-                audio_out.timestep_embedding,
+            ax = (
+                self._process_output(
+                    self.audio_scale_shift_table,
+                    self.audio_norm_out,
+                    self.audio_proj_out,
+                    audio_out.x,
+                    audio_out.timestep_embedding,
+                )
+                if audio_out is not None
+                else None
             )
-            if audio_out is not None
-            else None
-        )
+        profiling.count("transformer_forwards")
         return vx, ax
 
 

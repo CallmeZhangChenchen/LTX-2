@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import torch
 
+from ltx_core import profiling
 from ltx_core.conditioning import ConditioningItem, VideoConditionByKeyframeIndex, VideoGeneratedKeyframeSlots
 from ltx_core.conditioning.types.latent_cond import AudioConditionByLatentIndex, VideoConditionByLatentIndex
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
@@ -51,6 +52,7 @@ def denoise_chunks(  # noqa: PLR0913
     denoiser: Denoiser | None = None,
     freeze_video: bool = False,
     freeze_audio: bool = False,
+    stage_label: str = "denoise",
 ) -> Iterator[Chunk]:
     """Denoise each ``Chunk`` through ``stage``, materializing conditionings and threading carry.
     ``denoiser`` (``SimpleDenoiser`` when omitted) is shared by every chunk; each chunk's positive
@@ -99,14 +101,16 @@ def denoise_chunks(  # noqa: PLR0913
             else None
         )
 
-        video_state, audio_state = stage(
-            denoiser=denoiser,
-            sigmas=sigmas,
-            noiser=noiser,
-            modalities=VideoAudio(video=video, audio=audio),
-            loop=loop,
-            max_batch_size=max_batch_size,
-        )
+        profiling.count(f"{stage_label}.chunks")
+        with profiling.timer(f"{stage_label}.chunk"):
+            video_state, audio_state = stage(
+                denoiser=denoiser,
+                sigmas=sigmas,
+                noiser=noiser,
+                modalities=VideoAudio(video=video, audio=audio),
+                loop=loop,
+                max_batch_size=max_batch_size,
+            )
         video_latent = video_state.latent if video_state is not None else None
         audio_latent = audio_state.latent if audio_state is not None else None
         # A frozen modality is conditioning, not output: keep the latent that went in rather
@@ -153,13 +157,14 @@ def spatially_upsample_chunks(chunks: Iterator[Chunk], upsampler: VideoUpsampler
         if chunk.video is None:
             yield chunk
             continue
-        video = upsampler(chunk.video[:1])
-        sidecar = chunk.generated_keyframes
-        if sidecar is not None:
-            sidecar = replace(sidecar, latent=upsampler(sidecar.latent[:1]))
-        incoming = chunk.incoming_keyframes
-        if incoming is not None:
-            incoming = replace(incoming, latent=upsampler(incoming.latent[:1]))
+        with profiling.timer("upsample.chunk"):
+            video = upsampler(chunk.video[:1])
+            sidecar = chunk.generated_keyframes
+            if sidecar is not None:
+                sidecar = replace(sidecar, latent=upsampler(sidecar.latent[:1]))
+            incoming = chunk.incoming_keyframes
+            if incoming is not None:
+                incoming = replace(incoming, latent=upsampler(incoming.latent[:1]))
         yield replace(chunk, video=video, generated_keyframes=sidecar, incoming_keyframes=incoming)
 
 
@@ -214,26 +219,28 @@ def decode_chunks(
         if chunk.video is None:
             raise ValueError("decode_chunks requires chunk.video")
         layout = chunk.layout
-        decoded_frames = _decode_chunk_video(
-            chunk,
-            video_decoder,
-            tiling_config,
-            generator,
-            dtype=dtype,
-            keyframes=keyframes,
-        )
+        with profiling.timer("decode.video"):
+            decoded_frames = _decode_chunk_video(
+                chunk,
+                video_decoder,
+                tiling_config,
+                generator,
+                dtype=dtype,
+                keyframes=keyframes,
+            )
         if decoded_frames is None:
             continue
 
         frames = _drop_video_overlap(decoded_frames, layout.prev_video_carry_frames)
-        audio, seam_fade_samples = _vocoded_chunk_audio(
-            chunk,
-            frames,
-            audio_decoder,
-            fps=fps,
-            pending_tail=pending_tail,
-        )
-        pending_tail, audio = _apply_pending_audio_crossfade(pending_tail, audio, seam_fade_samples)
+        with profiling.timer("decode.audio"):
+            audio, seam_fade_samples = _vocoded_chunk_audio(
+                chunk,
+                frames,
+                audio_decoder,
+                fps=fps,
+                pending_tail=pending_tail,
+            )
+            pending_tail, audio = _apply_pending_audio_crossfade(pending_tail, audio, seam_fade_samples)
 
         if pending_tail is not None:
             yield _blend_pending_video_tail(pending_tail, decoded_frames, layout.prev_video_carry_frames)

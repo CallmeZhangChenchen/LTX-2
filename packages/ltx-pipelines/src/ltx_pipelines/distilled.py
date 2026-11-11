@@ -486,6 +486,7 @@ class DistilledPipeline:
             noiser=ctx.noiser,
             fps=frame_rate,
             noise_scale=1.0,
+            stage_label="stage_1",
             **self._sampler_kwargs(seed, ANCESTRAL_NOISE_SEED_OFFSET),
         )
         upscaled = spatially_upsample_chunks(base, self.upsampler)
@@ -495,6 +496,7 @@ class DistilledPipeline:
             sigmas=stage_2_sigmas,
             noiser=ctx.noiser,
             fps=frame_rate,
+            stage_label="stage_2",
             **self._sampler_kwargs(seed, ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET),
         )
         return (

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 
+from ltx_core import profiling
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.batch_split import BatchSplitAdapter
 from ltx_core.components.noisers import Noiser
@@ -460,15 +461,17 @@ class DiffusionStage:
                 audio_state = _build_state(audio, audio_tools, noiser, self._dtype, self._device)
 
             wrapped = BatchSplitAdapter(transformer, max_batch_size=max_batch_size)  # type: ignore[arg-type]
-            video_state, audio_state = loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                transformer=wrapped,
-                denoiser=denoiser,
-                v_context=video.context if video is not None else None,
-                a_context=audio.context if audio is not None else None,
-            )
+            profiling.count("stage.calls")
+            with profiling.timer("stage.denoise_loop"):
+                video_state, audio_state = loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    transformer=wrapped,
+                    denoiser=denoiser,
+                    v_context=video.context if video is not None else None,
+                    a_context=audio.context if audio is not None else None,
+                )
 
             if video_state is not None and video_tools is not None:
                 video_state = video_tools.clear_conditioning(video_state)
