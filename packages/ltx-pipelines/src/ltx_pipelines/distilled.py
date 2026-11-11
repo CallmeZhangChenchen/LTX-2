@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from ltx_core import profiling
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.conditioning import ConditioningItem
@@ -384,10 +385,38 @@ class DistilledPipeline:
         chunk_config: ChunkConfig | None = None,
     ) -> PipelineOutput:
         """Generate a video.
+
         Each stage samples according to ``self.use_ancestral_sampler``: the ancestral (SDE) Euler
         sampler on an LTX-2.5+ checkpoint, the deterministic one below that.
         ``chunk_config=None`` plans a single chunk covering the snapped clip.
         """
+        # Warmup pass: run the full pipeline N times so torch.compile / CUDA graph / kernel
+        # JIT settle before we start recording.  profiling.begin_round() returns True for
+        # warmup and silently discards every timer/count inside this round.
+        if profiling.begin_round():
+            print(
+                f"[ltx_profiling] warmup pass (remaining after this: {profiling.warmup_rounds()})",
+                flush=True,
+            )
+            _ = self(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                frame_rate=frame_rate,
+                images=images,
+                num_frames=num_frames,
+                vae_dtype=vae_dtype,
+                tiling_config=tiling_config,
+                enhance_prompt=enhance_prompt,
+                enhance_static_cache=enhance_static_cache,
+                stage_1_sigmas=stage_1_sigmas,
+                stage_2_sigmas=stage_2_sigmas,
+                color_space=color_space,
+                generated_keyframes=generated_keyframes,
+                decode_with_keyframes=decode_with_keyframes,
+                chunk_config=chunk_config,
+            )
         chunks, num_frames, tiling_config = self.stream_chunks(
             prompt=prompt,
             seed=seed,
