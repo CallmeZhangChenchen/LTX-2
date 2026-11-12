@@ -3,8 +3,6 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import time
-
 import torch
 
 from ltx_core import profiling
@@ -192,9 +190,7 @@ class DistilledPipeline:
         self.device = device or get_device()
         self.dtype = torch.bfloat16
         registry = registry or ModelRegistry()
-        _load_t0 = time.perf_counter()
 
-        _t = time.perf_counter()
         self.prompt_encoder = PromptEncoder(
             model_paths,
             self.dtype,
@@ -204,9 +200,6 @@ class DistilledPipeline:
             alloc_trim_strategy=alloc_trim_strategy,
             prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
         )
-        print(f"[ltx_load] text_encoder (Gemma) ......... {time.perf_counter() - _t:7.2f}s")
-
-        _t = time.perf_counter()
         self.image_conditioner = ImageConditioner(
             model_paths.video_vae(),
             self.dtype,
@@ -214,9 +207,6 @@ class DistilledPipeline:
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
-        print(f"[ltx_load] video_vae (ImageConditioner) .. {time.perf_counter() - _t:7.2f}s")
-
-        _t = time.perf_counter()
         self.stage = DiffusionStage.from_checkpoint(
             model_paths.transformer(),
             self.dtype,
@@ -228,9 +218,6 @@ class DistilledPipeline:
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
         )
-        print(f"[ltx_load] transformer (DiT) ............ {time.perf_counter() - _t:7.2f}s")
-
-        _t = time.perf_counter()
         self.upsampler = VideoUpsampler(
             model_paths.video_vae(),
             spatial_upsampler_path,
@@ -239,9 +226,6 @@ class DistilledPipeline:
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
-        print(f"[ltx_load] spatial_upsampler ............ {time.perf_counter() - _t:7.2f}s")
-
-        _t = time.perf_counter()
         self.video_decoder = VideoDecoder(
             model_paths.video_vae(),
             self.dtype,
@@ -250,9 +234,6 @@ class DistilledPipeline:
             alloc_trim_strategy=alloc_trim_strategy,
             diffvae_optimization=diffvae_optimization,
         )
-        print(f"[ltx_load] video_decoder ................ {time.perf_counter() - _t:7.2f}s")
-
-        _t = time.perf_counter()
         self.audio_decoder = AudioDecoder(
             model_paths.audio_vae(),
             self.dtype,
@@ -260,17 +241,12 @@ class DistilledPipeline:
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
-        print(f"[ltx_load] audio_vae .................... {time.perf_counter() - _t:7.2f}s")
-
-        _t = time.perf_counter()
         self.duration_predictor = DurationPredictor.from_checkpoint(
             model_paths.duration_head_path,
             self.dtype,
             self.device,
         )
         self.use_ancestral_sampler = should_use_ancestral_sampler(model_paths.transformer())
-        print(f"[ltx_load] duration_head + sampler_probe . {time.perf_counter() - _t:7.2f}s")
-        print(f"[ltx_load] ---- total pipeline init ------ {time.perf_counter() - _load_t0:7.2f}s")
 
     def _prepare_run(  # noqa: PLR0913
         self,
@@ -294,7 +270,8 @@ class DistilledPipeline:
         """Validate inputs, encode prompts, and resolve frame count / tiling before chunk planning."""
         require_num_frames_source(num_frames, self.duration_predictor)
         enhance_prompt_image = images[0].path if images else None
-        images = self.image_conditioner.load_conditionings(images, color_space)
+        with profiling.timer('image_conditioning'):
+            images = self.image_conditioner.load_conditionings(images, color_space)
         assert_resolution(height=height, width=width, is_two_stage=True)
         assert_generated_keyframes_request(decode_with_keyframes, generated_keyframes, self.stage)
 
@@ -304,12 +281,13 @@ class DistilledPipeline:
         if vae_dtype is None:
             vae_dtype = dtype
 
-        (ctx_p,) = self.prompt_encoder(
-            [prompt],
-            enhance_first_prompt=enhance_prompt,
-            enhance_static_cache=enhance_static_cache,
-            enhance_prompt_image=enhance_prompt_image,
-        )
+        with profiling.timer('gemma.encode'):
+            (ctx_p,) = self.prompt_encoder(
+                [prompt],
+                enhance_first_prompt=enhance_prompt,
+                enhance_static_cache=enhance_static_cache,
+                enhance_prompt_image=enhance_prompt_image,
+            )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
         resolved_num_frames = snap_frames_to_grid(
