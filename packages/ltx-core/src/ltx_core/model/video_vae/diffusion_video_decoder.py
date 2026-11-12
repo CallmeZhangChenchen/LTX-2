@@ -10,6 +10,7 @@ from typing import Iterator, List, Literal, Tuple
 import torch
 from torch import nn
 
+from ltx_core import profiling
 from ltx_core.devices import upload_from_host
 from ltx_core.model.disposable import Disposable
 from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
@@ -777,11 +778,12 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         pad_trailing: bool,
     ) -> torch.Tensor:
         """Run stage 4 + diffusion on one stage-4 feature tile (isolation)."""
-        context_tile = self.forward_stage_4(
-            feat_tile,
-            drop_leading_frame=is_origin,
-            pad_trailing=pad_trailing,
-        )
+        with profiling.timer('vae.stage_4'):
+            context_tile = self.forward_stage_4(
+                feat_tile,
+                drop_leading_frame=is_origin,
+                pad_trailing=pad_trailing,
+            )
 
         x_t = x_t_tile_init
         _, num_steps = timestep.shape
@@ -790,21 +792,25 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
             t_next = timestep[:, i + 1]
             if self.deferred_stage4_upsample:
                 x = self._x_for_diff_step(x_t)
-                model_out = self.forward_diff_step_deferred(x, context_tile, t_now, drop_leading_frame=is_origin).to(
-                    torch.float32
-                )
+                with profiling.timer('vae.stage5.diff_step'):
+                    model_out = self.forward_diff_step_deferred(x, context_tile, t_now, drop_leading_frame=is_origin).to(
+                        torch.float32
+                    )
             else:
                 context_and_x = self._context_and_x_for_diff_step(context_tile, x_t)
-                model_out = self.forward_diff_step(context_and_x, t_now).to(torch.float32)
+                with profiling.timer('vae.stage5.diff_step'):
+                    model_out = self.forward_diff_step(context_and_x, t_now).to(torch.float32)
             x_t = self._euler_step(x_t, model_out, t_now, t_next)
 
         t_now = timestep[:, -1]
         if self.deferred_stage4_upsample:
             x = self._x_for_diff_step(x_t)
-            model_out = self.forward_diff_step_deferred(x, context_tile, t_now, drop_leading_frame=is_origin)
+            with profiling.timer('vae.stage5.diff_step'):
+                model_out = self.forward_diff_step_deferred(x, context_tile, t_now, drop_leading_frame=is_origin)
         else:
             context_and_x = self._context_and_x_for_diff_step(context_tile, x_t)
-            model_out = self.forward_diff_step(context_and_x, t_now)
+            with profiling.timer('vae.stage5.diff_step'):
+                model_out = self.forward_diff_step(context_and_x, t_now)
         if self.model_output_type == "x0":
             return model_out
         return self._euler_step(x_t, model_out.to(torch.float32), t_now, torch.zeros_like(t_now))
@@ -868,16 +874,17 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         policy applied by the caller, as the plain path does); ``None`` draws fresh noise. The
         keyframe stream always draws its own -- its planes are not part of the video canvas.
         """
-        context_tile, keyframes = self.forward_stage_4_with_keyframes(
-            feat_tile,
-            keyframes,
-            pixel_frame_indices,
-            drop_leading_frame=is_origin,
-            pad_trailing=pad_trailing,
-            stage4_time_origin=stage4_time_origin,
-            pixel_time_origin=pixel_time_origin,
-            clip_start_frame=clip_start_frame,
-        )
+        with profiling.timer('vae.stage_4'):
+            context_tile, keyframes = self.forward_stage_4_with_keyframes(
+                feat_tile,
+                keyframes,
+                pixel_frame_indices,
+                drop_leading_frame=is_origin,
+                pad_trailing=pad_trailing,
+                stage4_time_origin=stage4_time_origin,
+                pixel_time_origin=pixel_time_origin,
+                clip_start_frame=clip_start_frame,
+            )
 
         batch = context_tile.shape[0]
         canvas_t, canvas_h, canvas_w = self._stage5_canvas_from_context(context_tile, drop_leading_frame=is_origin)
@@ -902,20 +909,22 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
                 if final and self.model_output_type == "x0":
                     # An x0 model's last step never reads the noise again; release both canvases now.
                     x_t = keyframe_x_t = None  # type: ignore[assignment]
-                return self.forward_diff_step_deferred_with_keyframes(
-                    x_in,
-                    context_tile,
-                    keyframe_x_in,
-                    keyframes.x,
-                    t_now,
-                    keyframes.planes,
-                    drop_leading_frame=is_origin,
-                )
+                with profiling.timer('vae.stage5.diff_step'):
+                    return self.forward_diff_step_deferred_with_keyframes(
+                        x_in,
+                        context_tile,
+                        keyframe_x_in,
+                        keyframes.x,
+                        t_now,
+                        keyframes.planes,
+                        drop_leading_frame=is_origin,
+                    )
             context_and_x = self._context_and_x_for_diff_step(context_tile, x_t)
             keyframe_context_and_x = self._keyframe_context_and_x_for_diff_step(
                 keyframes.x, keyframe_x_t, keyframes.planes.valid.device_tensor
             )
-            return self.forward_diff_step_with_keyframes(context_and_x, keyframe_context_and_x, t_now, keyframes.planes)
+            with profiling.timer('vae.stage5.diff_step'):
+                return self.forward_diff_step_with_keyframes(context_and_x, keyframe_context_and_x, t_now, keyframes.planes)
 
         _, num_steps = timestep.shape
         for i in range(num_steps - 1):
@@ -1506,7 +1515,8 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
             for dim in (2, 3, 4):
                 torch._dynamo.mark_dynamic(latent_padded, dim)
 
-        feat_s4 = self.forward_stages_1_to_3(latent_padded, drop_leading_frame=True)
+        with profiling.timer('vae.stages_1_to_3'):
+            feat_s4 = self.forward_stages_1_to_3(latent_padded, drop_leading_frame=True)
 
         batch = latent.shape[0]
         timestep = self.default_inference_timesteps.to(latent.device).unsqueeze(0).expand(batch, -1)
